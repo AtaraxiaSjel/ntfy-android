@@ -1,0 +1,96 @@
+name: Manual Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag for the new release'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current code
+        uses: actions/checkout@v4
+
+      - name: Apply Patch Locally
+        run: |
+          echo "Applying patch for the build process."
+          echo "${{ secrets.FIREBASE_PATCH }}" | base64 --decode > selfhosted.patch
+          if ! git apply --check selfhosted.patch; then
+            echo "::error::Patch cannot be applied cleanly. Please check for conflicts."
+            exit 1
+          fi
+          git apply selfhosted.patch
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Play version with Gradle
+        run: |
+          ./gradlew assemblePlayRelease
+          ./gradlew bundlePlayRelease
+
+      - name: Build F-Droid version with Gradle
+        run: |
+          ./gradlew assembleFdroidRelease
+          ./gradlew bundleFdroidRelease
+
+      - name: Create and Push New Tag
+        run: |
+          echo "Tagging the current commit with '${{ github.event.inputs.tag_name }}' and pushing..."
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions@github.com"
+          git tag ${{ github.event.inputs.tag_name }}
+          git push origin ${{ github.event.inputs.tag_name }}
+          sleep 10
+
+      - name: Prepare Artifact for Release
+        run: |
+          mkdir -p ./release_artifacts
+          find . -name "*.apk" -exec cp {} ./release_artifacts/ \;
+          find . -name "*.aab" -exec cp {} ./release_artifacts/ \;
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_artifacts/*.*
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: "Release ${{ github.event.inputs.tag_name }}"
+
+      - name: Send ntfy success notification
+        if: success()
+        run: |
+          curl -u "${{ secrets.NTFY_USER }}:${{ secrets.NTFY_PASSWORD }}" \
+            -H "Title: ✅ New Manual Release Successful: ${{ github.event.inputs.tag_name }}" \
+            -H "Click: ${{ steps.create_release.outputs.html_url }}" \
+            -d "A new APK has been built for ${{ github.repository }}." \
+            ${{ secrets.NTFY_SERVER || 'https://ntfy.sh' }}/${{ secrets.NTFY_TOPIC }}
+
+  notify_on_failure:
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+
+    steps:
+      - name: Send ntfy failure notification
+        run: |
+          curl -u "${{ secrets.NTFY_USER }}:${{ secrets.NTFY_PASSWORD }}" \
+            -H "Title: ❌ Manual Build FAILED in ${{ github.repository }}" \
+            -H "Priority: high" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Workflow '${{ github.workflow }}' failed. See details on GitHub Actions." \
+            ${{ secrets.NTFY_SERVER || 'https://ntfy.sh' }}/${{ secrets.NTFY_TOPIC }}
